@@ -1,0 +1,918 @@
+// ───────────────────────────────────────────────────────────────────────────
+// SAS WEB APP — Prisma schema
+// Implements the SaaS architecture specified in "COMPLETE SaaS PRODUCT PLAN.pdf".
+//
+// Hierarchy (plan §78):
+//   User → Identity → Workspace → Organization → Team → Member → Role
+//        → Permission → Subscription → Entitlement → Usage → Business Data
+//
+// Tenant isolation (plan §49): every business-owned record carries an
+// organization_id that is derived from the authenticated session/context on
+// the server — never trusted from the browser.
+// ───────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
+  engineType      = "client"
+}
+
+// PostgreSQL is the production target (product plan §47). In development, both
+// the CLI and the runtime connect through the PGlite driver adapter — an
+// embedded, pure-WASM PostgreSQL — so the app runs with zero external
+// infrastructure while remaining 100% PostgreSQL-native.
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// IDENTITY & AUTH (plan §5-9)
+// ══════════════════════════════════════════════════════════════════════════
+
+model User {
+  id           String   @id @default(cuid())
+  email        String?  @unique
+  phone        String?  @unique
+  firstName    String?
+  lastName     String?
+  name         String?
+  avatarUrl    String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  identities        UserIdentity[]
+  sessions          Session[]
+  otpVerifications  OtpVerification[]
+  memberships       OrganizationMember[]
+  invitations       OrganizationInvitation[] // relation backed by OrganizationInvitation.invitedBy
+  auditLogs         AuditLog[]
+  notifications     Notification[]
+  // The user's own personal workspace (created at signup — plan §3.2)
+  personalWorkspace Workspace?           @relation("PersonalWorkspace")
+
+  @@index([email])
+  @@index([phone])
+}
+
+// plan §7 — a person has ONE account but MANY identities (email / phone /
+// google). Logging in via a new method links to the SAME user, never a new one.
+model UserIdentity {
+  id              String   @id @default(cuid())
+  userId          String
+  provider        String // email | phone | google
+  providerAccount String @unique // email address / phone E.164 / google sub
+  verified        Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  lastLoginAt     DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([provider, providerAccount])
+}
+
+model Session {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  device    String?
+  browser   String?
+  ip        String?
+  userAgent String?
+  createdAt DateTime  @default(now())
+  lastSeen  DateTime  @default(now())
+  expiresAt DateTime
+  revokedAt DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model OtpVerification {
+  id            String    @id @default(cuid())
+  userId        String
+  purpose       String // signup_email | signup_phone | login | ...
+  channel       String // email | phone
+  target        String // masked-able destination
+  otpHash       String // NEVER raw OTP (plan §9)
+  attempts      Int       @default(0)
+  maxAttempts   Int       @default(5)
+  resendCount   Int       @default(0)
+  expiresAt     DateTime
+  lastResendAt  DateTime?
+  verifiedAt    DateTime?
+  ip            String?
+  createdAt     DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose])
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// WORKSPACE / ORGANIZATION (plan §3, §12-15)
+// ══════════════════════════════════════════════════════════════════════════
+
+enum WorkspaceType {
+  PERSONAL
+  TEAM
+  BUSINESS
+  COMPANY
+  ENTERPRISE
+}
+
+enum OrganizationStatus {
+  ACTIVE
+  SUSPENDED
+  CANCELLED
+  ARCHIVED
+}
+
+model Workspace {
+  id             String           @id @default(cuid())
+  slug           String           @unique
+  name           String
+  type           WorkspaceType    @default(PERSONAL)
+  industry       String?
+  country        String?
+  state          String?
+  city           String?
+  currency       String           @default("INR")
+  taxSystem      String?
+  isOrganization Boolean          @default(false)
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  ownerId String?  @unique
+  owner   User?   @relation("PersonalWorkspace", fields: [ownerId], references: [id], onDelete: SetNull)
+
+  organization  Organization?
+  customers     Customer[]
+  suppliers     Supplier[]
+  products      Product[]
+  warehouses    Warehouse[]
+  quotations    Quotation[]
+  salesOrders   SalesOrder[]
+  invoices      Invoice[]
+  payments      Payment[]
+  purchaseOrders PurchaseOrder[]
+  grns          Grn[]
+  expenses      Expense[]
+  auditLogs     AuditLog[]
+
+  @@index([ownerId])
+}
+
+model Organization {
+  id          String             @id @default(cuid())
+  workspaceId String             @unique
+  legalName   String?
+  status      OrganizationStatus @default(ACTIVE)
+  plan        String? // convenience display of current plan
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  workspace        Workspace           @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  members          OrganizationMember[]
+  invitations      OrganizationInvitation[]
+  teams            Team[]
+  roles            Role[]
+  branches         Branch[]
+  subscriptions    Subscription[]
+  coupons          Coupon[]
+}
+
+model Branch {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  code           String?
+  country        String?
+  state          String?
+  city           String?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+}
+
+enum OrganizationRole {
+  OWNER
+  ORG_ADMIN
+  MANAGER
+  SALES_MANAGER
+  SALES_EXECUTIVE
+  INVENTORY_MANAGER
+  PURCHASE_MANAGER
+  ACCOUNTANT
+  VIEWER
+  CUSTOM
+}
+
+enum MemberStatus {
+  PENDING
+  ACTIVE
+  INVITED
+  SUSPENDED
+  DEACTIVATED
+}
+
+model OrganizationMember {
+  id             String           @id @default(cuid())
+  organizationId String
+  userId         String
+  role           OrganizationRole @default(VIEWER)
+  customRoleId   String?
+  status         MemberStatus     @default(ACTIVE)
+  joinedAt       DateTime         @default(now())
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  organization Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  customRole   Role?           @relation("MemberCustomRole", fields: [customRoleId], references: [id])
+  teamMembers  TeamMember[]
+
+  @@unique([organizationId, userId])
+  @@index([userId])
+}
+
+model OrganizationInvitation {
+  id             String           @id @default(cuid())
+  organizationId String
+  email          String?
+  phone          String?
+  role           OrganizationRole @default(VIEWER)
+  teamId         String?
+  token          String           @unique
+  status         String           @default("PENDING") // PENDING | ACCEPTED | REVOKED | EXPIRED
+  invitedById    String?
+  expiresAt      DateTime?
+  createdAt      DateTime         @default(now())
+  acceptedAt     DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  invitedBy    User?        @relation(fields: [invitedById], references: [id], onDelete: SetNull)
+
+  @@index([organizationId])
+  @@index([email])
+}
+
+model Team {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  description    String?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  members      TeamMember[]
+
+  @@index([organizationId])
+}
+
+model TeamMember {
+  id       String   @id @default(cuid())
+  teamId   String
+  memberId String
+  addedAt  DateTime @default(now())
+
+  team   Team               @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  member OrganizationMember @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, memberId])
+}
+
+model Permission {
+  id          String @id @default(cuid())
+  key         String @unique // e.g. invoices.create, products.view
+  description String?
+
+  roles RolePermission[]
+}
+
+model Role {
+  id             String             @id @default(cuid())
+  organizationId String
+  name           String
+  isSystem       Boolean            @default(false)
+  isCustom       Boolean            @default(false)
+  createdAt      DateTime           @default(now())
+
+  organization Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  permissions  RolePermission[]
+  members      OrganizationMember[] @relation("MemberCustomRole")
+
+  @@index([organizationId])
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+  createdAt    DateTime @default(now())
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// SUBSCRIPTION ENGINE (plan §16-33)
+// ══════════════════════════════════════════════════════════════════════════
+
+enum SubscriptionState {
+  TRIAL
+  ACTIVE
+  PAST_DUE
+  GRACE_PERIOD
+  SUSPENDED
+  CANCELLED
+  EXPIRED
+}
+
+enum BillingCycle {
+  MONTHLY
+  ANNUAL
+}
+
+model SubscriptionPlan {
+  id              String       @id @default(cuid())
+  code            String       @unique // individual | team | business | enterprise
+  name            String
+  description     String?
+  monthlyPrice    Float        @default(0)
+  annualPrice     Float        @default(0)
+  currency        String       @default("INR")
+  tier            Int          @default(0)
+  isPublic        Boolean      @default(true)
+  published       Boolean      @default(true)
+  featured        Boolean      @default(false)
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  entitlements SubscriptionEntitlement[]
+  subscriptions Subscription[]
+  addons       SubscriptionAddon[]
+}
+
+// Feature entitlements are DATA, not code (plan §17 — do NOT hard-code limits).
+model SubscriptionEntitlement {
+  id         String  @id @default(cuid())
+  planId     String
+  featureKey String // users.max, products.max, warehouses.max, invoices.monthly, whatsapp.enabled, api.enabled ...
+  value      String
+  createdAt  DateTime @default(now())
+
+  plan SubscriptionPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  @@unique([planId, featureKey])
+  @@index([planId])
+}
+
+model Subscription {
+  id              String            @id @default(cuid())
+  organizationId  String
+  planId          String
+  state           SubscriptionState @default(TRIAL)
+  billingCycle    BillingCycle      @default(MONTHLY)
+  seatsUsed       Int               @default(1)
+  seatsPurchased  Int               @default(1)
+  currentPeriodStart DateTime       @default(now())
+  currentPeriodEnd   DateTime?
+  trialEndsAt     DateTime?
+  cancelAtPeriodEnd Boolean         @default(false)
+  provider        String            @default("manual") // razorpay | stripe | manual
+  providerRef     String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  organization Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  plan         SubscriptionPlan   @relation(fields: [planId], references: [id])
+  items        SubscriptionItem[]
+  addons       SubscriptionAddonItem[]
+  events       SubscriptionEvent[]
+
+  @@index([organizationId])
+}
+
+model SubscriptionItem {
+  id             String   @id @default(cuid())
+  subscriptionId String
+  kind           String // seat | warehouse | addon
+  description    String?
+  quantity       Int      @default(1)
+  unitPrice      Float    @default(0)
+  createdAt      DateTime @default(now())
+
+  subscription Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@index([subscriptionId])
+}
+
+model SubscriptionAddon {
+  id          String  @id @default(cuid())
+  planId      String
+  code        String  @unique
+  name        String
+  unitPrice   Float   @default(0)
+  billingCycle BillingCycle @default(MONTHLY)
+  createdAt   DateTime @default(now())
+
+  plan  SubscriptionPlan      @relation(fields: [planId], references: [id], onDelete: Cascade)
+  items SubscriptionAddonItem[]
+}
+
+model SubscriptionAddonItem {
+  id             String   @id @default(cuid())
+  subscriptionId String
+  addonId        String
+  quantity       Int      @default(1)
+  createdAt      DateTime @default(now())
+
+  subscription Subscription      @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  addon        SubscriptionAddon @relation(fields: [addonId], references: [id])
+
+  @@index([subscriptionId])
+}
+
+model SubscriptionEvent {
+  id             String   @id @default(cuid())
+  subscriptionId String
+  organizationId String
+  type           String // created | payment_success | payment_failed | plan_changed | seat_added | seat_removed | cancelled | renewed | trial_started ...
+  meta           String?
+  createdAt      DateTime @default(now())
+
+  subscription Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@index([subscriptionId])
+  @@index([organizationId])
+}
+
+model Coupon {
+  id             String   @id @default(cuid())
+  organizationId String?
+  code           String   @unique
+  percentOff     Float?
+  amountOff      Float?
+  currency       String   @default("INR")
+  active         Boolean  @default(true)
+  expiresAt      DateTime?
+  createdAt      DateTime @default(now())
+
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+}
+
+// Usage metering service records (plan §33)
+model UsageRecord {
+  id             String   @id @default(cuid())
+  organizationId String
+  metric         String // usage.users | usage.products | usage.invoices | usage.storage ...
+  value          Int      @default(0)
+  periodStart    DateTime
+  periodEnd      DateTime
+  createdAt      DateTime @default(now())
+
+  @@unique([organizationId, metric, periodStart])
+  @@index([organizationId])
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// BUSINESS CORE (plan §34-37)
+// ══════════════════════════════════════════════════════════════════════════
+
+// ── Parties ────────────────────────────────────────────────────────────────
+
+model Customer {
+  id             String   @id @default(cuid())
+  organizationId String
+  workspaceId    String
+  name           String
+  company        String?
+  email          String?
+  phone          String?
+  gstin          String?
+  currency       String   @default("INR")
+  outstanding    Float    @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  workspace    Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  addresses    CustomerAddress[]
+  quotations   Quotation[]
+  salesOrders   SalesOrder[]
+  invoices     Invoice[]
+  payments     Payment[]
+
+  @@index([workspaceId])
+  @@index([organizationId])
+}
+
+model CustomerAddress {
+  id         String   @id @default(cuid())
+  customerId String
+  label      String?
+  line1      String?
+  line2      String?
+  city       String?
+  state      String?
+  postalCode String?
+  country    String?  @default("India")
+  createdAt  DateTime @default(now())
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([customerId])
+}
+
+model Supplier {
+  id             String   @id @default(cuid())
+  organizationId String
+  workspaceId    String
+  name           String
+  company        String?
+  email          String?
+  phone          String?
+  gstin          String?
+  payable        Float    @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  workspace      Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  purchaseOrders PurchaseOrder[]
+  grns           Grn[]
+
+  @@index([workspaceId])
+  @@index([organizationId])
+}
+
+// ── Catalog ────────────────────────────────────────────────────────────────
+
+model Category {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  parentId       String?
+  createdAt      DateTime @default(now())
+
+  products Product[]
+
+  @@index([organizationId])
+}
+
+model Brand {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  createdAt      DateTime @default(now())
+
+  products Product[]
+
+  @@index([organizationId])
+}
+
+model Unit {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  symbol         String
+  createdAt      DateTime @default(now())
+
+  products Product[]
+
+  @@index([organizationId])
+}
+
+model Tax {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String // GST, VAT ...
+  rate           Float
+  createdAt      DateTime @default(now())
+
+  @@index([organizationId])
+}
+
+model Product {
+  id             String   @id @default(cuid())
+  organizationId String
+  workspaceId    String
+  name           String
+  sku            String?
+  barcode        String?
+  categoryId     String?
+  brandId        String?
+  unitId         String?
+  hsnSac         String?
+  salePrice      Float    @default(0)
+  purchasePrice  Float    @default(0)
+  taxRate        Float    @default(0)
+  minStock       Float    @default(0)
+  trackInventory Boolean  @default(true)
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  workspace  Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  category   Category?        @relation(fields: [categoryId], references: [id])
+  brand      Brand?           @relation(fields: [brandId], references: [id])
+  unit       Unit?            @relation(fields: [unitId], references: [id])
+  stocks     WarehouseStock[]
+  movements  StockMovement[]
+
+  @@index([workspaceId])
+  @@index([organizationId])
+  @@index([sku])
+  @@index([barcode])
+}
+
+// ── Warehouses & stock (plan §36) ─────────────────────────────────────────
+
+model Warehouse {
+  id             String   @id @default(cuid())
+  organizationId String
+  workspaceId    String
+  name           String
+  code           String?
+  address        String?
+  createdAt      DateTime @default(now())
+
+  workspace Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  stocks    WarehouseStock[]
+  movements StockMovement[]
+  grns      Grn[]
+
+  @@index([workspaceId])
+  @@index([organizationId])
+}
+
+model WarehouseStock {
+  warehouseId String
+  productId   String
+  quantity    Float @default(0) // could be negative-free enforced in-app
+
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  product   Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@id([warehouseId, productId])
+}
+
+enum MovementType {
+  OPENING_STOCK
+  GRN
+  SALES
+  SALES_RETURN
+  PURCHASE_RETURN
+  ADJUSTMENT_IN
+  ADJUSTMENT_OUT
+  TRANSFER_IN
+  TRANSFER_OUT
+}
+
+// Every change creates a stock movement (plan §36)
+model StockMovement {
+  id             String       @id @default(cuid())
+  organizationId String
+  productId      String
+  warehouseId    String
+  type           MovementType
+  quantity       Float // signed
+  referenceType  String? // grn | invoice | order | quotation | adjustment
+  referenceId    String?
+  note           String?
+  createdAt      DateTime     @default(now())
+
+  product   Product   @relation(fields: [productId], references: [id])
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@index([warehouseId])
+  @@index([organizationId])
+}
+
+// ── Sales documents (plan §34-35) ─────────────────────────────────────────
+
+enum DocumentStatus {
+  DRAFT
+  SENT
+  VIEWED
+  ACCEPTED
+  REJECTED
+  EXPIRED
+  CONVERTED
+  PAID
+  PARTIALLY_PAID
+  OVERDUE
+  VOID
+}
+
+model Quotation {
+  id             String         @id @default(cuid())
+  organizationId String
+  workspaceId    String
+  customerId     String
+  number         String
+  status         DocumentStatus @default(DRAFT)
+  lineItems      String         @default("[]") // JSON array snapshot
+  subtotal       Float          @default(0)
+  discount       Float          @default(0)
+  tax            Float          @default(0)
+  total          Float          @default(0)
+  notes          String?
+  terms          String?
+  validUntil     DateTime?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  customer  Customer  @relation(fields: [customerId], references: [id])
+
+  @@index([workspaceId])
+  @@index([customerId])
+  @@index([organizationId])
+}
+
+model SalesOrder {
+  id             String         @id @default(cuid())
+  organizationId String
+  workspaceId    String
+  customerId     String
+  quotationId    String?
+  number         String
+  status         DocumentStatus @default(DRAFT)
+  lineItems      String         @default("[]")
+  subtotal       Float          @default(0)
+  discount       Float          @default(0)
+  tax            Float          @default(0)
+  total          Float          @default(0)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  customer  Customer  @relation(fields: [customerId], references: [id])
+
+  @@index([workspaceId])
+  @@index([customerId])
+  @@index([organizationId])
+}
+
+model Invoice {
+  id             String         @id @default(cuid())
+  organizationId String
+  workspaceId    String
+  customerId     String
+  salesOrderId   String?
+  number         String
+  status         DocumentStatus @default(DRAFT)
+  lineItems      String         @default("[]")
+  subtotal       Float          @default(0)
+  discount       Float          @default(0)
+  tax            Float          @default(0)
+  total          Float          @default(0)
+  paid           Float          @default(0)
+  dueDate        DateTime?
+  paidAt         DateTime?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  customer  Customer  @relation(fields: [customerId], references: [id])
+  payments  Payment[]
+
+  @@index([workspaceId])
+  @@index([customerId])
+  @@index([organizationId])
+}
+
+model Payment {
+  id             String   @id @default(cuid())
+  organizationId String
+  workspaceId    String
+  customerId     String?
+  invoiceId      String?
+  amount         Float
+  method         String   @default("cash") // cash | upi | bank | card | razorpay | stripe
+  reference      String?
+  receivedAt     DateTime @default(now())
+  createdAt      DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  customer  Customer? @relation(fields: [customerId], references: [id])
+  invoice   Invoice?  @relation(fields: [invoiceId], references: [id])
+
+  @@index([workspaceId])
+  @@index([invoiceId])
+  @@index([organizationId])
+}
+
+// ── Purchase & GRN (plan §37) ─────────────────────────────────────────────
+
+model PurchaseOrder {
+  id             String         @id @default(cuid())
+  organizationId String
+  workspaceId    String
+  supplierId     String
+  number         String
+  status         DocumentStatus @default(DRAFT)
+  lineItems      String         @default("[]")
+  subtotal       Float          @default(0)
+  total          Float          @default(0)
+  expectedAt     DateTime?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  supplier  Supplier  @relation(fields: [supplierId], references: [id])
+
+  @@index([workspaceId])
+  @@index([supplierId])
+  @@index([organizationId])
+}
+
+model Grn {
+  id             String   @id @default(cuid())
+  organizationId String
+  workspaceId    String
+  purchaseOrderId String
+  supplierId     String
+  number         String
+  status         String   @default("RECEIVED") // DRAFT | RECEIVED | PARTIAL | REJECTED
+  lineItems      String   @default("[]")
+  warehouseId    String?
+  note           String?
+  receivedAt     DateTime @default(now())
+  createdAt      DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  supplier  Supplier  @relation(fields: [supplierId], references: [id])
+  warehouse Warehouse? @relation(fields: [warehouseId], references: [id])
+
+  @@index([workspaceId])
+  @@index([purchaseOrderId])
+  @@index([organizationId])
+}
+
+model Expense {
+  id             String   @id @default(cuid())
+  organizationId String
+  workspaceId    String
+  category       String?
+  description    String?
+  amount         Float
+  incurredAt     DateTime @default(now())
+  createdAt      DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId])
+  @@index([organizationId])
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// SYSTEM (plan §55-56)
+// ══════════════════════════════════════════════════════════════════════════
+
+model AuditLog {
+  id             String   @id @default(cuid())
+  organizationId String?
+  workspaceId    String?
+  userId         String?
+  action         String
+  entity         String?
+  entityId       String?
+  oldValue       String?
+  newValue       String?
+  ip             String?
+  device         String?
+  createdAt      DateTime @default(now())
+
+  user      User?      @relation(fields: [userId], references: [id], onDelete: SetNull)
+  workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId])
+  @@index([userId])
+  @@index([entity, entityId])
+}
+
+model Notification {
+  id             String   @id @default(cuid())
+  userId         String
+  organizationId String?
+  kind           String // info | warning | success | error
+  title          String
+  body           String?
+  read           Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, read])
+}
