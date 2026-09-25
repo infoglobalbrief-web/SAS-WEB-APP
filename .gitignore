@@ -1,0 +1,35 @@
+# --- Dependencies ---
+node_modules/
+.pnp
+.pnp.js
+
+# --- Next.js ---
+.next/
+out/
+next-env.d.ts
+
+# --- Build / coverage ---
+build/
+dist/
+coverage/
+
+# --- Prisma ---
+# Local PGlite data directory (embedded Postgres files).
+.data/
+# Generated client output (any launcher that writes into the repo).
+src/generated/
+prisma/*.db
+prisma/*.db-journal
+
+# --- Environment (real secrets) ---
+.env
+.env.local
+.env.*.local
+
+# --- Misc ---
+.DS_Store
+*.log
+.vercel
+.eslintcache
+*.tsbuildinfo
+node_modules/.cache/
